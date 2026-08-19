@@ -1,8 +1,9 @@
 # nix-wormhole
 
-`nix-copy-closure`, but over [croc](https://github.com/schollz/croc).
-Send the full closure of a Nix store path to a friend with a short one-time
-code: no SSH access, no binary cache, works through NAT.
+`nix-copy-closure` without SSH: the sender serves a signed
+[harmonia](https://github.com/nix-community/harmonia) binary cache over a
+[dumbpipe](https://github.com/n0-computer/dumbpipe) tunnel; the receiver
+fetches with a plain `nix copy`. Works through NAT via iroh's hole punching.
 
 ## Usage
 
@@ -11,38 +12,41 @@ Sender:
 ```console
 $ nix build nixpkgs#hello
 $ nix run github:pinpox/nix-wormhole -- send ./result
-Computing closure...
-Exporting 42 store paths...
-Compressed closure: 12M
+Starting harmonia binary cache on 127.0.0.1:23456...
 
-Code is: nix-0549-4229-6918
 On the other computer run:
 
-    nix run github:pinpox/nix-wormhole -- receive nix-0549-4229-6918
+    nix run github:pinpox/nix-wormhole -- receive \
+        nodeadvertisement... \
+        'nix-wormhole-1234-1:...' \
+        /nix/store/...-hello-2.12.2
+
+Serving; press Ctrl-C when the receiver is done.
 ```
 
-Receiver:
+Receiver: paste the printed command. It opens the tunnel on a local port and
+substitutes the closure with the tunnel as an *extra* substituter, so
+anything available on your normal caches (cache.nixos.org, ...) is fetched
+from there and only private paths travel through the tunnel.
 
-```console
-$ nix run github:pinpox/nix-wormhole -- receive nix-0549-4229-6918
-Importing into Nix store...
-Imported 42 store path(s). Root:
-/nix/store/...-hello-2.12.2
-```
+## How it works
 
-`send` accepts one or more store paths, or symlinks to them (like `./result`).
-The whole runtime closure is exported with `nix-store --export`, compressed
-with `zstd -T0 --long=27`, sent through croc (parallel streams, LAN
-discovery, relay fallback through NAT, croc's own compression disabled),
-and imported on the other side with `nix-store --import`.
+- `send` generates a one-shot ed25519 signing key (`nix key
+  generate-secret`) and starts harmonia on localhost with `sign_key_paths`,
+  so narinfos are signed on the fly - no `nix store sign`, no store writes.
+- The cache is exposed with `dumbpipe listen-tcp`; the printed ticket encodes
+  the sender's node address.
+- `receive` runs `dumbpipe connect-tcp` and realises the requested paths via
+  `nix-store --realise` with `extra-substituters` / `extra-trusted-public-keys`.
+  Harmonia advertises priority 50, so cache.nixos.org (40) wins for public
+  paths; already-present paths are skipped. NARs are zstd-compressed on the
+  fly (level 1 + long-distance matching).
 
 ## Notes
 
-- The transferred closure is unsigned. The nix-daemon only accepts unsigned
-  imports from root or a `trusted-user` (on standard NixOS, `@wheel` is
-  already trusted, no sudo needed). If the import fails with a signature
-  error, run `sudo nix-wormhole receive` instead. There is no
-  `--no-check-sigs` escape hatch: the daemon enforces this per-user,
-  not per-invocation.
-- The closure is staged as a compressed temp file before sending, so you
-  need enough space in `$TMPDIR` for the compressed closure.
+- Overriding `extra-trusted-public-keys` is restricted to root and
+  `trusted-users` (on standard NixOS, `@wheel` already qualifies). If the
+  substitution fails with a signature error, rerun with `sudo`.
+- The signing key lives only in a temp dir for the lifetime of the send
+  command; anyone with the ticket can fetch from your store while it runs,
+  so stop it (Ctrl-C) when the transfer is done.

@@ -1,21 +1,49 @@
 #!/usr/bin/env bash
-# nix-copy-closure over croc.
+# nix-copy-closure over dumbpipe, served by a signing harmonia binary cache.
 set -euo pipefail
 
 usage() {
 	cat <<EOF
-nix-wormhole - send Nix store closures through croc
+nix-wormhole - serve Nix store closures through dumbpipe
 
 Usage:
-  nix-wormhole send PATH [PATH...]   Export the closure of PATH(s) and send it
-  nix-wormhole receive [CODE]        Receive a closure and import it
+  nix-wormhole send PATH [PATH...]              Serve PATH(s) via a signed
+                                                harmonia cache over dumbpipe
+  nix-wormhole receive TICKET PUBKEY PATH...    Substitute the closure
+                                                through the tunnel
 
 PATH may be a /nix/store path or a symlink to one (e.g. ./result).
 
-Importing unsigned store paths requires root or a trusted-user
-(see nix.conf), so the receiving side may need:
-  sudo nix-wormhole receive
+The sender generates a one-shot signing key; harmonia signs every narinfo
+with it, and the receiver passes the matching public key to nix via
+'trusted-public-keys'. Overriding that option still requires root or a
+trusted-user (on standard NixOS, @wheel is already trusted), so the
+receiving side may need:
+  sudo nix-wormhole receive ...
 EOF
+}
+
+pick_port() {
+	local port
+	while :; do
+		port=$((20000 + RANDOM % 40000))
+		if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+			echo "$port"
+			return
+		fi
+	done
+}
+
+wait_port() {
+	local port=$1 _i
+	for _i in $(seq 1 100); do
+		if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "error: service on port $port did not come up" >&2
+	return 1
 }
 
 send() {
@@ -37,83 +65,71 @@ send() {
 	done
 
 	tmp=$(mktemp -d) # global: EXIT trap fires after function scope ends
-	trap 'rm -rf "$tmp"' EXIT
+	trap 'rm -rf "$tmp"; kill 0' EXIT INT TERM
 
-	# Friendly file name: first root without the store hash prefix
-	local name
-	name=$(basename "${paths[0]}")
-	name=${name#*-}
-	local file="$tmp/${name:-closure}.closure.zst"
+	# harmonia signs narinfos on the fly, so no 'nix store sign' needed
+	local pubkey
+	nix --extra-experimental-features nix-command key generate-secret \
+		--key-name "nix-wormhole-$$-1" >"$tmp/secret"
+	chmod 600 "$tmp/secret"
+	pubkey=$(nix --extra-experimental-features nix-command \
+		key convert-secret-to-public <"$tmp/secret")
 
-	echo "Computing closure..." >&2
-	local closure=()
-	mapfile -t closure < <(nix-store --query --requisites "${paths[@]}")
-	echo "Exporting ${#closure[@]} store paths..." >&2
-	nix-store --export "${closure[@]}" | zstd -q -T0 --long=27 -o "$file"
-	echo "Compressed closure: $(du -h "$file" | cut -f1)" >&2
-	echo >&2
-
-	local code
-	code=$(printf 'nix-%04d-%04d-%04d' \
-		"$(($(rand4) % 10000))" "$(($(rand4) % 10000))" "$(($(rand4) % 10000))")
-
-	cat >&2 <<-EOF
-		Code is: $code
-		On the other computer run:
-
-		    nix run github:pinpox/nix-wormhole -- receive $code
-
+	cat >"$tmp/harmonia.toml" <<-EOF
+		bind = "unix:$tmp/cache.sock"
+		# 50 loses against cache.nixos.org (40)
+		priority = 50
+		sign_key_paths = ["$tmp/secret"]
 	EOF
 
-	# --no-compress: payload is already zstd. Code goes via env (croc refuses
-	# secrets on argv). Banner is ours (above), so strip croc's own, which
-	# tells the receiver to run plain 'croc'.
-	CROC_SECRET=$code croc --no-compress send "$file" 2>&1 | strip_banner >&2
-}
+	echo "Starting harmonia binary cache..." >&2
+	CONFIG_FILE=$tmp/harmonia.toml harmonia-cache >&2 &
+	while [ ! -S "$tmp/cache.sock" ]; do sleep 0.1; done
 
-rand4() {
-	od -An -N4 -tu4 /dev/urandom | tr -d ' '
-}
-
-strip_banner() {
-	local l
-	while IFS= read -r l; do
-		l=${l##*$'\r'} # keep only the final segment of \r-overwritten lines
-		case $l in
-		# the getcroc.com URL is the last banner line we drop; everything
-		# after it (clipboard note, transfer progress) streams through raw
-		*getcroc.com*) exec cat ;;
-		"Code is:"* | "On the other computer run"* | *"croc nix-"*) ;;
-		*CROC_SECRET* | "(For "* | "Or receive in a browser:"* | "") ;;
-		*) printf '%s\n' "$l" ;;
-		esac
+	dumbpipe listen-unix --socket-path "$tmp/cache.sock" >"$tmp/dumbpipe.log" 2>&1 &
+	local ticket=
+	while [ -z "$ticket" ]; do
+		sleep 0.1
+		ticket=$(sed -n 's/.*connect-unix .* \([a-z0-9]*\)$/\1/p' "$tmp/dumbpipe.log")
 	done
+
+	cat >&2 <<-EOF
+
+		On the other computer run:
+
+		    nix run github:pinpox/nix-wormhole -- receive \\
+		        $ticket \\
+		        '$pubkey' \\
+		        ${paths[*]}
+
+		Serving; press Ctrl-C when the receiver is done.
+	EOF
+	wait
 }
 
 receive() {
-	tmp=$(mktemp -d) # global: EXIT trap fires after function scope ends
-	trap 'rm -rf "$tmp"' EXIT
-
-	# croc only takes the code via env or interactive prompt, not argv
-	if [ $# -ge 1 ]; then
-		(cd "$tmp" && CROC_SECRET=$1 croc --yes)
-	else
-		(cd "$tmp" && croc --yes)
-	fi
-
-	local file
-	file=$(find "$tmp" -maxdepth 1 -type f | head -n 1)
-	if [ -z "$file" ]; then
-		echo "error: no file received" >&2
+	if [ $# -lt 3 ]; then
+		usage >&2
 		exit 1
 	fi
+	local ticket=$1 pubkey=$2
+	shift 2
 
-	echo "Importing into Nix store..." >&2
-	local imported
-	imported=$(zstd -qdc --long=27 "$file" | nix-store --import)
+	local port
+	port=$(pick_port)
+	echo "Opening tunnel to sender..." >&2
+	dumbpipe connect-tcp --addr "127.0.0.1:$port" "$ticket" >&2 &
+	trap 'kill %1 2>/dev/null' EXIT
+	wait_port "$port"
 
-	echo "Imported $(wc -l <<<"$imported") store path(s). Root:" >&2
-	tail -n 1 <<<"$imported"
+	echo "Substituting closure (public paths via your normal caches)..." >&2
+	nix-store --realise \
+		--option extra-substituters "http://127.0.0.1:$port" \
+		--option extra-trusted-public-keys "$pubkey" \
+		"$@" >/dev/null
+
+	echo "Done:" >&2
+	printf '%s\n' "$@"
 }
 
 case ${1:-} in

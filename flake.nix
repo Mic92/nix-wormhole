@@ -1,5 +1,5 @@
 {
-  description = "nix-copy-closure over magic-wormhole";
+  description = "nix-copy-closure over dumbpipe, served by a signing harmonia cache";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -23,11 +23,10 @@
           nix-wormhole = pkgs.writeShellApplication {
             name = "nix-wormhole";
             runtimeInputs = with pkgs; [
-              croc
-              zstd
+              dumbpipe
+              harmonia
               nix
               coreutils
-              findutils
             ];
             text = builtins.readFile ./nix-wormhole.sh;
           };
